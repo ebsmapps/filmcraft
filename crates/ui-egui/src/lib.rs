@@ -1009,7 +1009,10 @@ impl FilmcraftApp {
         }
         let ctx = ui.ctx().clone();
         self.auto.begin_frame();
-        self.frames.set_context(&ctx);
+        self.frames.set_repaint(|| {
+            let ctx = ctx.clone();
+            Box::new(move || ctx.request_repaint())
+        });
         self.session.poll_persistence();
         panels::trim_monitor::advance(self, &ctx);
         if self.session.persistence.is_some() && self.session.is_dirty() {
