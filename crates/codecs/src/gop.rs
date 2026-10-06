@@ -178,6 +178,20 @@ impl Drop for DecodingGuard {
     }
 }
 
+/// The sync sample to start decoding at for sample `i` (shown at `want_pts`), and whether `i` is
+/// a leading picture.
+///
+/// A leading picture is decoded after its sync sample but shown before it: HEVC RASL pictures
+/// after a CRA, or the B-pictures of an open GOP in H.264 / MPEG-2. It is predicted from the GOP
+/// before, so a decoder that starts at its own sync sample drops it (HEVC: NoRaslOutputFlag) and
+/// nothing at the wanted time comes out. Phone and screen recordings trimmed by an edit list often
+/// start on one. Decoding starts at the previous sync sample instead; for a decodable leading
+/// picture (HEVC RADL) that only costs one more GOP.
+fn start_for(s: &dyn VideoSamples, i: usize, want_pts: i64) -> (usize, bool) {
+    let key = s.sync_before(i);
+    if key > 0 && key < i && s.pts(key) > want_pts { (s.sync_before(key - 1), true) } else { (key, false) }
+}
+
 /// Decoder + decoded-frame cache for one video track.
 pub struct GopCache {
     state: Mutex<State>,
@@ -318,16 +332,18 @@ impl GopCache {
         if st.intra {
             return self.intra_frame(st, s, i, want_pts);
         }
-        let mut key = s.sync_before(i);
+        let (mut key, leading) = start_for(s, i, want_pts);
         // Continue the running decoder when it has passed the wanted sample's sync sample and
         // either has not reached the sample yet or has been fed it without outputting it yet
         // (a frame-threaded decoder holds many pictures in flight). Otherwise the frame was
-        // evicted or lies in another GOP: restart at the sync sample.
+        // evicted or lies in another GOP: restart at the sync sample. A leading picture also
+        // needs the run to have started at or before the earlier GOP: one started at the
+        // picture's own sync sample has dropped it.
         let running = st.next != usize::MAX && st.next <= n;
         // Decoding on through a short stretch into the next GOP is cheaper than a restart, and
         // playback wants those frames anyway.
         let near = st.next <= key && key - st.next <= CONTINUE_THROUGH;
-        let continuing = running && (st.next > key || near) && (i >= st.next || (st.start <= i && want_pts > st.out_max));
+        let continuing = running && (!leading || st.start <= key) && (st.next > key || near) && (i >= st.next || (st.start <= i && want_pts > st.out_max));
         if !continuing {
             SEEKS.fetch_add(1, Ordering::Relaxed);
             // The container's sync flags may be wrong for the codec (an MP4 without `stss` marks
@@ -408,9 +424,9 @@ impl GopCache {
         want_pts: i64,
         n: usize,
     ) -> crate::Result<Vec<crate::video::DecodedFrame>> {
-        let mut key = s.sync_before(i);
+        let (mut key, leading) = start_for(s, i, want_pts);
         // Continue the running decoder when the wanted sample is ahead within this GOP run.
-        let continuing = *next != usize::MAX && *next > key && *next <= i + 16 && *next <= n;
+        let continuing = !leading && *next != usize::MAX && *next > key && *next <= i + 16 && *next <= n;
         if !continuing {
             // The container's sync flags may be wrong for the codec (an MP4 without `stss` marks
             // every sample): step back to a sample the decoder can start from.
@@ -662,6 +678,115 @@ mod tests {
             assert_eq!(index_of(&c3.frame(&s3, i as i64 * 1000).expect("cached")), i);
         }
         assert_eq!(s3.resets.load(Ordering::Relaxed), 1);
+    }
+
+    /// Open GOPs like HEVC CRA + RASL. In decode order every GOP after the first is
+    /// [sync, leading, leading, trailing…]; the two leading pictures are shown before their sync
+    /// picture and reference the GOP before. pts = 1000 · display index.
+    struct OpenGop {
+        n: usize,
+        gop: usize,
+        resets: Arc<AtomicUsize>,
+    }
+
+    impl OpenGop {
+        fn new(gops: usize, gop: usize) -> Self {
+            Self { n: gops * gop, gop, resets: Default::default() }
+        }
+        /// Display index of decode-order sample `i`.
+        fn shown(&self, i: usize) -> usize {
+            let (g, o) = (i / self.gop, i % self.gop);
+            let base = g * self.gop;
+            match (g, o) {
+                (0, _) => i,
+                (_, 0) => base + 2,
+                (_, 1) => base,
+                (_, 2) => base + 1,
+                _ => i,
+            }
+        }
+        fn leading(&self, i: usize) -> bool {
+            i >= self.gop && matches!(i % self.gop, 1 | 2)
+        }
+    }
+
+    /// Drops a leading picture when decoding started at its own GOP, like a real decoder.
+    struct OpenGopDec {
+        gop: usize,
+        started: Option<usize>,
+        resets: Arc<AtomicUsize>,
+    }
+
+    impl VideoDecoder for OpenGopDec {
+        fn decode(&mut self, sample: &[u8], pts: i64) -> crate::Result<Vec<DecodedFrame>> {
+            let i = sample[0] as usize | (sample[1] as usize) << 8;
+            let started = *self.started.get_or_insert(i / self.gop);
+            let leading = sample[2] == 1;
+            if leading && started == i / self.gop {
+                return Ok(Vec::new());
+            }
+            Ok(vec![picture((pts, false))])
+        }
+        fn flush(&mut self) -> Vec<DecodedFrame> {
+            Vec::new()
+        }
+        fn reset(&mut self) {
+            self.resets.fetch_add(1, Ordering::Relaxed);
+            self.started = None;
+        }
+        fn name(&self) -> &str {
+            "open-gop"
+        }
+    }
+
+    impl VideoSamples for OpenGop {
+        fn count(&self) -> usize {
+            self.n
+        }
+        fn pts(&self, i: usize) -> i64 {
+            self.shown(i) as i64 * 1000
+        }
+        fn sync_before(&self, i: usize) -> usize {
+            i / self.gop * self.gop
+        }
+        fn sample_at(&self, t: i64) -> Option<usize> {
+            (0..self.n).find(|&i| self.pts(i) == t)
+        }
+        fn read(&self, i: usize) -> crate::Result<Vec<u8>> {
+            Ok(vec![i as u8, (i >> 8) as u8, self.leading(i) as u8])
+        }
+        fn make_decoder(&self) -> crate::Result<Box<dyn VideoDecoder>> {
+            Ok(Box::new(OpenGopDec { gop: self.gop, started: None, resets: self.resets.clone() }))
+        }
+    }
+
+    #[test]
+    fn leading_pictures_decode_from_the_previous_gop() {
+        // A clip trimmed to start on a leading picture (an iPhone HDR10 recording whose edit list
+        // begins at a RASL picture after a CRA): its first frame used to fail with "frame not
+        // produced", and with other frames cached an older frame came back instead.
+        let s = OpenGop::new(4, 10);
+        let c = GopCache::new(None);
+        for shown in [10usize, 11, 30, 31, 20, 5, 21, 12, 39] {
+            let f = c.frame(&s, shown as i64 * 1000).expect("frame");
+            assert_eq!(index_of(&f), shown, "frame {shown}");
+        }
+        // a run started at a sync sample doesn't serve that GOP's leading pictures: it restarts
+        let s = OpenGop::new(4, 10);
+        let c = GopCache::new(None);
+        assert_eq!(index_of(&c.frame(&s, 25_000).expect("frame")), 25);
+        let resets = s.resets.load(Ordering::Relaxed);
+        assert_eq!(index_of(&c.frame(&s, 20_000).expect("frame")), 20);
+        assert_eq!(s.resets.load(Ordering::Relaxed), resets + 1, "restarted one GOP earlier");
+        // trailing pictures of an open GOP still start at their own sync sample
+        let s = OpenGop::new(4, 10);
+        let c = GopCache::new(None);
+        assert_eq!(index_of(&c.frame(&s, 35_000).expect("frame")), 35);
+        // the nested-request path (a private decoder) too
+        let s = OpenGop::new(4, 10);
+        let c = GopCache::new(None);
+        let i = s.sample_at(30_000).expect("sample");
+        assert_eq!(index_of(&c.private_frame(&s, i, 30_000, s.count()).expect("frame")), 30);
     }
 
     fn is_draft(f: &VideoFrame) -> bool {
