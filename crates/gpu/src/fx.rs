@@ -15,6 +15,7 @@
 use std::collections::{HashMap, HashSet};
 
 use filmcraft_render::gpufx::FxOp;
+use filmcraft_render::lumetri_op::{CURVE_N, LumetriOp};
 use filmcraft_render::plan::LayerFx;
 
 /// Working texture format.
@@ -49,6 +50,7 @@ const OP_HFLIP: u32 = 26;
 const OP_VFLIP: u32 = 27;
 const OP_MIRROR: u32 = 28;
 const OP_OFFSET: u32 = 29;
+const OP_LUMETRI: u32 = 30;
 
 type Target = (wgpu::Texture, wgpu::TextureView);
 
@@ -90,6 +92,9 @@ struct Step {
     combine: bool,
     /// A blur pass of Unsharp Mask (the original stays untouched until the combine).
     unsharp_blur: bool,
+    /// Lumetri: its parameter and curve table ([`LumetriOp::gpu_data`], [`CURVE_N`] × 4
+    /// RGBA texels), bound as `aux`.
+    data: Option<Vec<f32>>,
 }
 
 fn step(code: u32, i1: [u32; 4], p: &[f32]) -> Step {
@@ -97,7 +102,7 @@ fn step(code: u32, i1: [u32; 4], p: &[f32]) -> Step {
     for (d, s) in q.iter_mut().zip(p) {
         *d = *s;
     }
-    Step { run: false, code, i1, p: q, combine: false, unsharp_blur: false }
+    Step { run: false, code, i1, p: q, combine: false, unsharp_blur: false, data: None }
 }
 
 /// Box passes along x (vertical = false) or y for the radii (radius 0 is a no-op on the CPU).
@@ -175,8 +180,41 @@ fn steps(op: &FxOp) -> Vec<Step> {
         FxOp::AlphaAdjust { opacity, ignore, invert, mask_only } => {
             out.push(step(OP_ALPHA_ADJUST, [*ignore as u32, *invert as u32, *mask_only as u32, 0], &[*opacity]));
         }
+        FxOp::Lumetri(op) => out.push(lumetri_step(op)),
     }
     out
+}
+
+fn lumetri_step(op: &LumetriOp) -> Step {
+    let mut s = step(OP_LUMETRI, [0; 4], &[]);
+    s.data = Some(op.gpu_data());
+    s
+}
+
+/// A step's data table as a texture (`CURVE_N` × 4 texels of RGBA f32).
+fn data_texture(device: &wgpu::Device, queue: &wgpu::Queue, data: &[f32]) -> Option<wgpu::TextureView> {
+    let (w, h) = (CURVE_N as u32, 4u32);
+    if data.len() != (w * h * 4) as usize || device.limits().max_texture_dimension_2d < w {
+        return None;
+    }
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("filmcraft-fx-data"),
+        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: FX_FORMAT,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+        &bytes,
+        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 16), rows_per_image: Some(h) },
+        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+    );
+    Some(texture.create_view(&Default::default()))
 }
 
 impl FxStage {
@@ -336,8 +374,13 @@ impl FxStage {
             }
             let keep = if s.unsharp_blur || s.combine { orig } else { None };
             let dst = (0..n).find(|k| *k != cur && Some(*k) != keep)?;
-            let aux = match (s.combine, orig) {
-                (true, Some(o)) => views.get(o)?,
+            let table;
+            let aux = match (s.combine, orig, &s.data) {
+                (true, Some(o), _) => views.get(o)?,
+                (_, _, Some(data)) => {
+                    table = data_texture(device, queue, data)?;
+                    &table
+                }
                 _ => dummy,
             };
             let mut bytes = Vec::with_capacity(96);

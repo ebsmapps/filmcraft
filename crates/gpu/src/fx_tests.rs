@@ -187,6 +187,78 @@ fn cases() -> Vec<(&'static str, Vec<(&'static str, ParamValue)>, bool)> {
         ("alpha_adjust", vec![("opacity", fl(60.0))], false),
         ("alpha_adjust", vec![("ignore", ParamValue::Bool(true)), ("invert", ParamValue::Bool(true))], false),
         ("alpha_adjust", vec![("invert", ParamValue::Bool(true)), ("mask_only", ParamValue::Bool(true)), ("opacity", fl(150.0))], false),
+        ("lumetri", vec![], false),
+        (
+            "lumetri",
+            vec![("exposure", fl(0.7)), ("contrast", fl(35.0)), ("highlights", fl(-40.0)), ("shadows", fl(30.0)), ("whites", fl(20.0)), ("blacks", fl(-25.0))],
+            false,
+        ),
+        ("lumetri", vec![("temperature", fl(40.0)), ("tint", fl(-30.0)), ("saturation", fl(140.0)), ("contrast", fl(-50.0))], false),
+        (
+            "lumetri",
+            vec![
+                ("faded_film", fl(40.0)),
+                ("vibrance", fl(60.0)),
+                ("creative_sat", fl(80.0)),
+                ("shadow_tint", col(0.3, 0.5, 0.7)),
+                ("highlight_tint", col(0.7, 0.55, 0.4)),
+            ],
+            false,
+        ),
+        ("lumetri", vec![("look", ParamValue::Choice(1)), ("look_intensity", fl(80.0))], false),
+        ("lumetri", vec![("look", ParamValue::Choice(2))], false),
+        ("lumetri", vec![("look", ParamValue::Choice(4)), ("look_intensity", fl(150.0))], false),
+        ("lumetri", vec![("look", ParamValue::Choice(5))], false),
+        ("lumetri", vec![("look", ParamValue::Choice(6)), ("vignette_amount", fl(-2.0)), ("vignette_roundness", fl(-50.0))], false),
+        ("lumetri", vec![("look", ParamValue::Choice(7))], false),
+        ("lumetri", vec![("look", ParamValue::Choice(8)), ("look_intensity", fl(60.0))], false),
+        ("lumetri", vec![("vignette_amount", fl(1.5)), ("vignette_midpoint", fl(30.0)), ("vignette_feather", fl(80.0))], false),
+        (
+            "lumetri",
+            vec![
+                ("wheel_shadows", pt(0.3, -0.2)),
+                ("wheel_midtones", pt(-0.1, 0.4)),
+                ("wheel_highlights", pt(0.2, 0.1)),
+                ("wheel_midtones_l", fl(-20.0)),
+                ("wheel_highlights_l", fl(30.0)),
+            ],
+            false,
+        ),
+        (
+            "lumetri",
+            vec![
+                ("curve_luma", ParamValue::Curve(vec![[0.0, 0.0], [0.3, 0.22], [0.7, 0.8], [1.0, 1.0]])),
+                ("curve_red", ParamValue::Curve(vec![[0.0, 0.05], [0.5, 0.55], [1.0, 1.0]])),
+                ("curve_green", ParamValue::Curve(vec![[0.0, 0.0], [0.4, 0.45], [1.0, 1.0]])),
+                ("curve_blue", ParamValue::Curve(vec![[0.0, 0.0], [0.6, 0.5], [1.0, 0.95]])),
+            ],
+            false,
+        ),
+        (
+            "lumetri",
+            vec![
+                ("hue_vs_sat", ParamValue::Curve(vec![[0.0, 0.5], [0.33, 0.9], [0.66, 0.5]])),
+                ("hue_vs_hue", ParamValue::Curve(vec![[0.1, 0.5], [0.2, 0.6], [0.3, 0.5]])),
+                ("hue_vs_luma", ParamValue::Curve(vec![[0.5, 0.5], [0.6, 0.3], [0.7, 0.5]])),
+                ("luma_vs_sat", ParamValue::Curve(vec![[0.0, 0.3], [0.5, 0.5], [1.0, 0.7]])),
+                ("sat_vs_sat", ParamValue::Curve(vec![[0.2, 0.5], [0.8, 0.8]])),
+            ],
+            true,
+        ),
+        (
+            "lumetri",
+            vec![
+                ("hsl_on", ParamValue::Bool(true)),
+                ("hsl_hue", fl(120.0)),
+                ("hsl_hue_range", fl(60.0)),
+                ("hsl_sat", fl(30.0)),
+                ("hsl_hue_shift", fl(40.0)),
+                ("hsl_temp", fl(50.0)),
+            ],
+            true,
+        ),
+        ("lumetri", vec![("hsl_on", ParamValue::Bool(true)), ("hsl_hue", fl(20.0)), ("hsl_show_mask", ParamValue::Choice(1))], true),
+        ("lumetri", vec![("hsl_on", ParamValue::Bool(true)), ("hsl_show_mask", ParamValue::Choice(3)), ("hsl_soft", fl(0.0))], true),
     ]
 }
 

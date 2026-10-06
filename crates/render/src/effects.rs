@@ -41,10 +41,10 @@ pub(crate) fn b(e: &EffectInstance, id: &str) -> bool {
     e.param(id).and_then(|p| p.value.as_bool()).unwrap_or(false)
 }
 /// A section switch (missing in older projects = on).
-fn on(e: &EffectInstance, id: &str) -> bool {
+pub(crate) fn on(e: &EffectInstance, id: &str) -> bool {
     e.param(id).and_then(|p| p.value.as_bool()).unwrap_or(true)
 }
-fn text<'e>(e: &'e EffectInstance, id: &str) -> &'e str {
+pub(crate) fn text<'e>(e: &'e EffectInstance, id: &str) -> &'e str {
     match e.param(id).map(|p| &p.value) {
         Some(ParamValue::Text(s)) => s,
         _ => "",
@@ -594,7 +594,7 @@ fn within_unit(v: [f32; 3], hdr: bool, f: impl Fn([f32; 3]) -> [f32; 3]) -> [f32
     o.map(|q| q * m)
 }
 
-fn lumetri(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
+pub(crate) fn lumetri(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
     let (basic_on, creative_on, vignette_on) = (on(e, "basic_on"), on(e, "creative_on"), on(e, "vignette_on"));
     let input_lut = if basic_on { crate::luts::resolve(cx.project, text(e, "input_lut")) } else { None };
     let bf = |id: &str| if basic_on { f(e, id, cx) } else { 0.0 };
@@ -1011,7 +1011,7 @@ pub fn curve_lut(points: &[[f32; 2]], n: usize) -> Vec<f32> {
 }
 
 /// Periodic (hue) curve: points around the colour wheel, neutral 0.5 where there are none.
-fn hue_lut(points: &[[f32; 2]], n: usize) -> Option<Vec<f32>> {
+pub(crate) fn hue_lut(points: &[[f32; 2]], n: usize) -> Option<Vec<f32>> {
     if points.is_empty() {
         return None;
     }
@@ -1026,16 +1026,16 @@ fn hue_lut(points: &[[f32; 2]], n: usize) -> Option<Vec<f32>> {
     Some(lut[n..2 * n].to_vec())
 }
 
-fn curve_param(e: &EffectInstance, id: &str) -> Option<Vec<[f32; 2]>> {
+pub(crate) fn curve_param(e: &EffectInstance, id: &str) -> Option<Vec<[f32; 2]>> {
     e.param(id).and_then(|p| p.value.as_curve().map(|c| c.to_vec()))
 }
 
-fn is_identity_curve(c: &[[f32; 2]]) -> bool {
+pub(crate) fn is_identity_curve(c: &[[f32; 2]]) -> bool {
     c.iter().all(|p| (p[0] - p[1]).abs() < 1e-4)
 }
 
 /// Wheel offset (zero-mean RGB direction for a wheel position).
-fn wheel_rgb(v: Vec2) -> [f32; 3] {
+pub(crate) fn wheel_rgb(v: Vec2) -> [f32; 3] {
     let len = (v.x * v.x + v.y * v.y).sqrt().min(1.0) as f32;
     if len < 1e-5 {
         return [0.0; 3];
@@ -1181,7 +1181,7 @@ fn lumetri_advanced(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
 
 /// The HSL Secondary key of one pixel's grading signal (0…1 per channel).
 #[inline]
-fn hsl_key(v: [f32; 3], hc: f32, hr: f32, smin: f32, lmin: f32, lmax: f32, soft: f32) -> f32 {
+pub(crate) fn hsl_key(v: [f32; 3], hc: f32, hr: f32, smin: f32, lmin: f32, lmax: f32, soft: f32) -> f32 {
     let h = rgb_to_hsl(v[0], v[1], v[2]);
     let dh = (h[0] - hc).abs().min(1.0 - (h[0] - hc).abs());
     let mh = 1.0 - ((dh - hr / 2.0) / soft).clamp(0.0, 1.0);

@@ -161,6 +161,8 @@ pub enum FxOp {
         invert: bool,
         mask_only: bool,
     },
+    /// Lumetri Color (the grades [`crate::lumetri_op::LumetriOp::eval`] covers).
+    Lumetri(Box<crate::lumetri_op::LumetriOp>),
 }
 
 /// Effect ids [`FxOp::eval`] understands (the GPU-capable standard effects).
@@ -196,6 +198,7 @@ pub const GPU_EFFECTS: &[&str] = &[
     "channel_mix",
     "color_replace",
     "alpha_adjust",
+    "lumetri",
 ];
 
 /// `Image::transformed` without the mip path: the destination rectangle it writes and the inverse.
@@ -225,6 +228,9 @@ impl FxOp {
     pub fn eval(e: &EffectInstance, cx: &FxCtx, w: usize, h: usize) -> Option<FxOp> {
         if !e.enabled {
             return None;
+        }
+        if e.effect == "lumetri" {
+            return crate::lumetri_op::LumetriOp::eval(e, cx).map(|op| FxOp::Lumetri(Box::new(op)));
         }
         Some(match e.effect.as_str() {
             "brightness_contrast" => FxOp::BrightnessContrast { br: f(e, "brightness", cx) / 100.0 * 0.4, co: 1.0 + f(e, "contrast", cx) / 100.0 },
@@ -458,6 +464,7 @@ impl FxOp {
             FxOp::ChannelMix { m } => m.iter().all(|r| fin(r)),
             FxOp::ColorReplace { sim, target, replace, replace_hsl, .. } => sim.is_finite() && fin(target) && fin(replace) && fin(replace_hsl),
             FxOp::AlphaAdjust { opacity, .. } => opacity.is_finite(),
+            FxOp::Lumetri(op) => op.finite(),
         }
     }
 
@@ -709,6 +716,7 @@ impl FxOp {
                     }
                 });
             }
+            FxOp::Lumetri(op) => op.apply(img),
         }
     }
 }
