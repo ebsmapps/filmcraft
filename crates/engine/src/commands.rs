@@ -1437,10 +1437,12 @@ fn build() -> Vec<CommandSpec> {
             }
             Ok(Value::Null)
         }),
-        cmd!("markers.clearCurrent", "Clear Selected Marker", ["Markers"], Some("Cmd+Alt+M"), "{}", has_seq, |s, _| {
+        // `marker`: that one (touch UIs delete the marker they show); else those at the playhead
+        cmd!("markers.clearCurrent", "Clear Selected Marker", ["Markers"], Some("Cmd+Alt+M"), r#"{"marker":id?}"#, has_seq, |s, p| {
             let t = s.playhead();
+            let id = u64_p(p, "marker").map(MarkerId);
             s.edit_sequence("Clear Marker", |q, _, _| {
-                q.markers.retain(|m| m.start != t);
+                q.markers.retain(|m| if let Some(id) = id { m.id != id } else { m.start != t });
                 Ok(())
             })?;
             Ok(Value::Null)
@@ -1457,11 +1459,13 @@ fn build() -> Vec<CommandSpec> {
             "Edit Marker…",
             [],
             None,
-            r#"{"marker":id,"name":str?,"comment":str?,"color":label?,"durationFrames":i64?}"#,
+            r#"{"marker":id,"name":str?,"comment":str?,"color":label?,"durationFrames":i64?,"time":ticks?}"#,
             has_seq,
             |s, p| {
                 let id = u64_p(p, "marker").map(MarkerId).ok_or_else(|| bad("markers.edit", "need `marker`"))?;
                 let rate = s.sequence_rate();
+                // `time` (or frame / seconds / timecode) moves it
+                let start = time_p(s, p, "");
                 let p = p.clone();
                 s.edit_sequence("Edit Marker", |q, _, _| {
                     let m = q.markers.iter_mut().find(|m| m.id == id).ok_or_else(|| bad("markers.edit", "no such marker"))?;
@@ -1476,6 +1480,10 @@ fn build() -> Vec<CommandSpec> {
                     }
                     if let Some(f) = p.get("durationFrames").and_then(Value::as_i64) {
                         m.duration = rate.tick_of(f);
+                    }
+                    if let Some(t) = start {
+                        m.start = t;
+                        q.markers.sort_by_key(|m| m.start);
                     }
                     Ok(())
                 })?;
