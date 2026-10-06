@@ -188,6 +188,14 @@ fn cases() -> Vec<(&'static str, Vec<(&'static str, ParamValue)>, bool)> {
         ("alpha_adjust", vec![("ignore", ParamValue::Bool(true)), ("invert", ParamValue::Bool(true))], false),
         ("alpha_adjust", vec![("invert", ParamValue::Bool(true)), ("mask_only", ParamValue::Bool(true)), ("opacity", fl(150.0))], false),
         ("lumetri", vec![], false),
+        // LUTs (FilmCraft's built-in 33³ cubes): camera conversion in, look out, both
+        ("lumetri", vec![("input_lut", txt("builtin:slog3-sgamut3cine-to-rec709")), ("exposure", fl(0.4))], false),
+        ("lumetri", vec![("look_lut", txt("builtin:look-teal-orange")), ("look_intensity", fl(70.0))], false),
+        (
+            "lumetri",
+            vec![("input_lut", txt("builtin:applelog-to-rec709")), ("look_lut", txt("builtin:look-night")), ("contrast", fl(20.0))],
+            false,
+        ),
         (
             "lumetri",
             vec![("exposure", fl(0.7)), ("contrast", fl(35.0)), ("highlights", fl(-40.0)), ("shadows", fl(30.0)), ("whites", fl(20.0)), ("blacks", fl(-25.0))],
@@ -260,6 +268,10 @@ fn cases() -> Vec<(&'static str, Vec<(&'static str, ParamValue)>, bool)> {
         ("lumetri", vec![("hsl_on", ParamValue::Bool(true)), ("hsl_hue", fl(20.0)), ("hsl_show_mask", ParamValue::Choice(1))], true),
         ("lumetri", vec![("hsl_on", ParamValue::Bool(true)), ("hsl_show_mask", ParamValue::Choice(3)), ("hsl_soft", fl(0.0))], true),
     ]
+}
+
+fn txt(s: &str) -> ParamValue {
+    ParamValue::Text(s.into())
 }
 
 /// Every effect case on the GPU against its CPU reference, on the working image read back as f32.

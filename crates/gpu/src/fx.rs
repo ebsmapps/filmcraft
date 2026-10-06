@@ -92,8 +92,8 @@ struct Step {
     combine: bool,
     /// A blur pass of Unsharp Mask (the original stays untouched until the combine).
     unsharp_blur: bool,
-    /// Lumetri: its parameter and curve table ([`LumetriOp::gpu_data`], [`CURVE_N`] × 4
-    /// RGBA texels), bound as `aux`.
+    /// Lumetri: its parameters, curve tables and LUTs ([`LumetriOp::gpu_data`], [`CURVE_N`]
+    /// RGBA texels a row, 4 rows or more), bound as `aux`.
     data: Option<Vec<f32>>,
 }
 
@@ -191,10 +191,12 @@ fn lumetri_step(op: &LumetriOp) -> Step {
     s
 }
 
-/// A step's data table as a texture (`CURVE_N` × 4 texels of RGBA f32).
+/// A step's data table as a texture (`CURVE_N` texels of RGBA f32 a row, at least 4 rows).
 fn data_texture(device: &wgpu::Device, queue: &wgpu::Queue, data: &[f32]) -> Option<wgpu::TextureView> {
-    let (w, h) = (CURVE_N as u32, 4u32);
-    if data.len() != (w * h * 4) as usize || device.limits().max_texture_dimension_2d < w {
+    let w = CURVE_N as u32;
+    let h = u32::try_from(data.len() / (CURVE_N * 4)).ok()?;
+    let max = device.limits().max_texture_dimension_2d;
+    if data.len() != (w * h * 4) as usize || h < 4 || max < w || max < h {
         return None;
     }
     let texture = device.create_texture(&wgpu::TextureDescriptor {

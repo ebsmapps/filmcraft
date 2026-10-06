@@ -7,12 +7,13 @@
 //! Secondary key and correction, each ending in the grade space's decode like the three CPU
 //! passes. `fx.wgsl` mirrors `pixel` line by line; [`LumetriOp::gpu_data`] is the table it reads.
 //!
-//! Covered: SDR (Rec. 709) grading without LUT files, Creative Sharpen or HSL Denoise / Blur.
-//! `eval` returns None for anything else, and the effect renders on the CPU as before.
+//! Covered: SDR (Rec. 709) grading, with Input and Look LUTs that are plain 3D cubes (up to
+//! [`GPU_LUT_MAX`]³), without Creative Sharpen or HSL Denoise / Blur. `eval` returns None for
+//! anything else (LUTs with a 1D shaper among them), and the effect renders on the CPU as before.
 
 use std::sync::Arc;
 
-use filmcraft_color::{GradeSpace, hsl_to_rgb, linear_to_srgb, rgb_to_hsl, srgb_to_linear};
+use filmcraft_color::{GradeSpace, Lut, Lut3d, hsl_to_rgb, linear_to_srgb, rgb_to_hsl, srgb_to_linear};
 use filmcraft_project::EffectInstance;
 
 use crate::effects::{FxCtx, apply_look, b, choice, color, curve_lut, curve_param, f, hsl_key, hue_lut, is_identity_curve, on, text, wheel_rgb};
@@ -20,6 +21,9 @@ use crate::image::Image;
 
 /// Entries of a curve table (the CPU's `lumetri_advanced` LUT size).
 pub const CURVE_N: usize = 1024;
+
+/// The largest LUT cube the GPU takes (65³ entries; bigger ones grade on the CPU).
+pub const GPU_LUT_MAX: usize = 65;
 
 /// Curve tables, in [`LumetriOp::curves`] order.
 pub const CURVES: [&str; 9] = ["curve_luma", "curve_red", "curve_green", "curve_blue", "hue_vs_sat", "hue_vs_hue", "hue_vs_luma", "luma_vs_sat", "sat_vs_sat"];
@@ -71,21 +75,33 @@ pub struct LumetriOp {
     /// [`CURVES`] tables (None: the curve is off or does nothing).
     pub curves: [Option<Arc<Vec<f32>>>; 9],
     pub hsl: Option<LumetriHsl>,
+    /// Basic Correction's Input LUT and Creative's Look LUT (plain 3D cubes; see [`gpu_cube`]).
+    pub input_lut: Option<Arc<Lut>>,
+    pub look_lut: Option<Arc<Lut>>,
+}
+
+/// The cube of a LUT the GPU can apply: a 3D table without a 1D shaper, 2³ to [`GPU_LUT_MAX`]³.
+pub fn gpu_cube(lut: &Lut) -> Option<&Lut3d> {
+    let cube = lut.cube.as_ref()?;
+    (lut.shaper.is_none() && (2..=GPU_LUT_MAX).contains(&cube.size) && cube.data.len() == cube.size.pow(3)).then_some(cube)
 }
 
 impl LumetriOp {
-    /// Evaluate `e` at `cx.t`. None when the grade needs something only the CPU does (HDR, LUT
-    /// files, Creative Sharpen, HSL Denoise / Blur).
+    /// Evaluate `e` at `cx.t`. None when the grade needs something only the CPU does (HDR, LUTs
+    /// with a shaper or over [`GPU_LUT_MAX`]³, Creative Sharpen, HSL Denoise / Blur).
     pub fn eval(e: &EffectInstance, cx: &FxCtx) -> Option<LumetriOp> {
         let (basic_on, creative_on, vignette_on) = (on(e, "basic_on"), on(e, "creative_on"), on(e, "vignette_on"));
         let (curves_on, wheels_on) = (on(e, "curves_on"), on(e, "wheels_on"));
         if GradeSpace::new(cx.working, f(e, "hdr_white", cx)).is_hdr() || GradeSpace::new(cx.working, f(e, "curves_hdr_range", cx)).is_hdr() {
             return None;
         }
-        if basic_on && !text(e, "input_lut").is_empty() {
+        // a reference that doesn't resolve is no LUT, as on the CPU
+        let input_lut = if basic_on { crate::luts::resolve(cx.project, text(e, "input_lut")) } else { None };
+        let look_lut = if creative_on { crate::luts::resolve(cx.project, text(e, "look_lut")) } else { None };
+        if input_lut.iter().chain(&look_lut).any(|l| gpu_cube(l).is_none()) {
             return None;
         }
-        if creative_on && (!text(e, "look_lut").is_empty() || (f(e, "sharpen", cx) / 100.0).abs() > 1e-3) {
+        if creative_on && (f(e, "sharpen", cx) / 100.0).abs() > 1e-3 {
             return None;
         }
         let hsl_on = b(e, "hsl_on");
@@ -103,12 +119,13 @@ impl LumetriOp {
         let hue = |id: &str| curve_param(e, id).filter(|_| curves_on).and_then(|c| hue_lut(&c, CURVE_N)).map(Arc::new);
         let curves =
             [lut(CURVES[0]), lut(CURVES[1]), lut(CURVES[2]), lut(CURVES[3]), hue(CURVES[4]), hue(CURVES[5]), hue(CURVES[6]), hue(CURVES[7]), hue(CURVES[8])];
-        let look = if creative_on { choice(e, "look") } else { 0 };
+        // a Look LUT takes precedence over the procedural looks
+        let look = if creative_on && look_lut.is_none() { choice(e, "look") } else { 0 };
         let v2 = |id: &str| e.param(id).map(|p| p.vec2_at(cx.t)).unwrap_or_default();
         let wheel = [wheel_rgb(v2("wheel_shadows")), wheel_rgb(v2("wheel_midtones")), wheel_rgb(v2("wheel_highlights"))];
         let lightness = [f(e, "wheel_shadows_l", cx) / 100.0, f(e, "wheel_midtones_l", cx) / 100.0, f(e, "wheel_highlights_l", cx) / 100.0];
         let wheels = wheels_on && (wheel.iter().flatten().any(|v| v.abs() > 1e-5) || lightness.iter().map(|v| v.abs()).sum::<f32>() > 1e-5);
-        let advanced = curves.iter().any(Option::is_some) || look > 0 || wheels;
+        let advanced = curves.iter().any(Option::is_some) || look > 0 || look_lut.is_some() || wheels;
 
         let hsl = hsl_on.then(|| LumetriHsl {
             hue: f(e, "hsl_hue", cx) / 360.0,
@@ -150,6 +167,8 @@ impl LumetriOp {
             lightness,
             curves,
             hsl,
+            input_lut,
+            look_lut,
         })
     }
 
@@ -185,6 +204,9 @@ impl LumetriOp {
             .all(|v| v.is_finite())
             && self.curves.iter().flatten().all(|c| c.iter().all(|v| v.is_finite()))
             && hsl
+            && self.input_lut.iter().chain(&self.look_lut).filter_map(|l| gpu_cube(l)).all(|c| {
+                c.domain_min.iter().chain(&c.domain_max).chain(c.data.iter().flatten()).all(|v| v.is_finite())
+            })
     }
 
     /// The CPU reference on a working image (straight colour per pixel, like `Image::map_rgb`).
@@ -204,6 +226,10 @@ impl LumetriOp {
     }
 
     fn basic(&self, c: [f32; 3], x: f32, y: f32, w: f32, h: f32) -> [f32; 3] {
+        let c = match &self.input_lut {
+            Some(l) => dec(l.apply(enc(c).map(|q| q.clamp(0.0, 1.0)))),
+            None => c,
+        };
         let g = self.gains;
         let lin = [c[0] * g[0] * self.exposure, c[1] * g[1] * self.exposure, c[2] * g[2] * self.exposure];
         let mut v = enc(lin);
@@ -253,7 +279,11 @@ impl LumetriOp {
 
     fn advanced_pass(&self, c: [f32; 3]) -> [f32; 3] {
         let mut v = enc(c);
-        if self.look > 0 {
+        if let Some(l) = &self.look_lut {
+            let lk = l.apply(v.map(|q| q.clamp(0.0, 1.0)));
+            let k = self.look_k;
+            v = [v[0] + (lk[0] - v[0]) * k, v[1] + (lk[1] - v[1]) * k, v[2] + (lk[2] - v[2]) * k];
+        } else if self.look > 0 {
             let lk = apply_look(self.look, v);
             let k = self.look_k;
             v = [v[0] + (lk[0] - v[0]) * k, v[1] + (lk[1] - v[1]) * k, v[2] + (lk[2] - v[2]) * k];
@@ -310,16 +340,22 @@ impl LumetriOp {
         dec(v)
     }
 
-    /// What `fx.wgsl` reads (an `Rgba32Float` texture [`CURVE_N`] wide, 4 rows, flattened): row 0
-    /// the scalars below, rows 1–3 the curve tables, four to a row (one per channel).
+    /// What `fx.wgsl` reads (an `Rgba32Float` texture [`CURVE_N`] wide, flattened): row 0 the
+    /// scalars below, rows 1–3 the curve tables, four to a row (one per channel), then from row 4
+    /// the LUT cubes, an entry a texel (red fastest): the Input LUT's, then the Look LUT's.
     ///
     /// Row 0, as texels: gains + exposure · b0 w0 shadows highlights · contrast faded creative sat ·
     /// shadow tint + vibrance · highlight tint + vignette · midpoint roundness feather look ·
     /// look strength, wheels, shadows and midtones lightness · shadow wheel + highlights lightness ·
     /// midtone wheel + advanced · highlight wheel + curve mask · HSL on, hue, range, sat min ·
-    /// luma min, luma max, soft, show mask · temp, tint, sat, shift.
+    /// luma min, luma max, soft, show mask · temp, tint, sat, shift · Input LUT size and first
+    /// texel, Look LUT size and first texel (size 0: none) · Input LUT domain min · its domain
+    /// max · Look LUT domain min · its domain max.
     pub fn gpu_data(&self) -> Vec<f32> {
-        let mut out = vec![0f32; CURVE_N * 4 * 4];
+        let (input, look) = (self.input_lut.as_deref().and_then(gpu_cube), self.look_lut.as_deref().and_then(gpu_cube));
+        let entries = |c: Option<&Lut3d>| c.map_or(0, |c| c.data.len());
+        let rows = 4 + (entries(input) + entries(look)).div_ceil(CURVE_N);
+        let mut out = vec![0f32; CURVE_N * rows * 4];
         let flag = |v: bool| if v { 1.0 } else { 0.0 };
         let mask = self.curves.iter().enumerate().filter(|(_, c)| c.is_some()).map(|(i, _)| 1u32 << i).sum::<u32>();
         let hsl = self.hsl.clone().unwrap_or(LumetriHsl {
@@ -394,6 +430,19 @@ impl LumetriOp {
         ];
         for (o, v) in out.iter_mut().zip(row0) {
             *o = v;
+        }
+        // the LUTs: a header in row 0 (texels 13–17), their entries from row 4
+        let mut texel = CURVE_N * 4;
+        for (k, cube) in [input, look].into_iter().enumerate() {
+            let Some(cube) = cube else { continue };
+            out[52 + 2 * k] = cube.size as f32;
+            out[53 + 2 * k] = texel as f32;
+            out[56 + 8 * k..59 + 8 * k].copy_from_slice(&cube.domain_min);
+            out[60 + 8 * k..63 + 8 * k].copy_from_slice(&cube.domain_max);
+            for e in &cube.data {
+                out[texel * 4..texel * 4 + 3].copy_from_slice(e);
+                texel += 1;
+            }
         }
         for (i, table) in self.curves.iter().enumerate() {
             if let Some(t) = table {
@@ -545,7 +594,23 @@ mod tests {
                 ("wheels_on", ParamValue::Bool(false)),
                 ("wheel_midtones_l", fl(50.0)),
             ],
+            // LUTs: a camera conversion in, a look out (it replaces the procedural look), half strength
+            vec![("input_lut", txt("builtin:slog3-sgamut3cine-to-rec709")), ("exposure", fl(0.4))],
+            vec![("look_lut", txt("builtin:look-teal-orange")), ("look", ParamValue::Choice(6)), ("look_intensity", fl(50.0))],
+            vec![
+                ("input_lut", txt("builtin:applelog-to-rec709")),
+                ("look_lut", txt("builtin:look-bleach-bypass")),
+                ("curve_luma", curve(&[[0.0, 0.1], [1.0, 0.9]])),
+                ("hsl_on", ParamValue::Bool(true)),
+            ],
+            // the sections' switches turn their LUTs off; a reference that doesn't resolve is none
+            vec![("input_lut", txt("builtin:slog3-sgamut3cine-to-rec709")), ("basic_on", ParamValue::Bool(false))],
+            vec![("look_lut", txt("lib:missing")), ("look", ParamValue::Choice(3))],
         ]
+    }
+
+    fn txt(s: &str) -> ParamValue {
+        ParamValue::Text(s.into())
     }
 
     /// The op reproduces `effects::lumetri` (the CPU's own Lumetri) wherever it claims to.
@@ -567,8 +632,6 @@ mod tests {
     fn hands_the_rest_to_the_cpu() {
         let fl = ParamValue::Float;
         for grade in [
-            vec![("input_lut", ParamValue::Text("builtin:rec709".into()))],
-            vec![("look_lut", ParamValue::Text("lib:1".into()))],
             vec![("sharpen", fl(40.0))],
             vec![("hsl_on", ParamValue::Bool(true)), ("hsl_blur", fl(10.0))],
             vec![("hsl_on", ParamValue::Bool(true)), ("hsl_denoise", fl(10.0))],
@@ -589,5 +652,27 @@ mod tests {
         assert_eq!(d[3], 2.0, "exposure");
         assert_eq!(d[39], 2.0, "curve mask: red only");
         assert!((d[(CURVE_N) * 4 + 1] - 0.1).abs() < 1e-6, "red table, first entry, green channel of row 1");
+
+        // a 33³ look LUT: rows 4… hold its entries, row 0 says where
+        let e = lumetri(&[("look_lut", txt("builtin:look-night"))]);
+        let op = LumetriOp::eval(&e, &cx()).unwrap();
+        let d = op.gpu_data();
+        let entries: usize = 33 * 33 * 33;
+        assert_eq!(d.len(), CURVE_N * (4 + entries.div_ceil(CURVE_N)) * 4);
+        assert_eq!((d[52], d[54], d[55]), (0.0, 33.0, (CURVE_N * 4) as f32), "no input LUT; the look's size and first texel");
+        assert_eq!(&d[64..67], &[0.0; 3]);
+        assert_eq!(&d[68..71], &[1.0; 3]);
+        let cube = gpu_cube(op.look_lut.as_ref().unwrap()).unwrap();
+        let last = (CURVE_N * 4 + entries - 1) * 4;
+        assert_eq!(&d[last..last + 3], &cube.data[entries - 1]);
+    }
+
+    #[test]
+    fn shaper_luts_grade_on_the_cpu() {
+        let shaper = filmcraft_color::Lut1d { domain_min: [0.0; 3], domain_max: [1.0; 3], data: vec![[0.0; 3], [1.0; 3]] };
+        let lut = Lut { title: String::new(), shaper: Some(shaper), cube: Some(Lut3d::identity(2)) };
+        assert!(lut.shaper.is_some() && gpu_cube(&lut).is_none());
+        assert!(gpu_cube(&Lut::from_cube(Lut3d::identity(17))).is_some());
+        assert!(gpu_cube(&Lut::from_cube(Lut3d::identity(GPU_LUT_MAX + 1))).is_none());
     }
 }

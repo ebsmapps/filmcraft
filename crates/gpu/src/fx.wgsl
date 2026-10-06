@@ -356,7 +356,8 @@ fn color_op(op: u32, c: vec3<f32>) -> vec3<f32> {
 //
 // `aux` row 0 holds the evaluated parameters (texel i = scalars 4i…4i+3, see `gpu_data`), rows
 // 1–3 the curve tables (luma, red, green, blue | hue→sat, hue→hue, hue→luma, luma→sat | sat→sat),
-// one per channel, `LUMETRI_N` entries each.
+// one per channel, `LUMETRI_N` entries each, and from row 4 the Input and Look LUT cubes, an
+// entry a texel.
 
 const LUMETRI_N: i32 = 1024;
 
@@ -378,6 +379,47 @@ fn curve_sample(k: u32, x: f32) -> f32 {
     let a = textureLoad(aux, vec2<i32>(i, row), 0)[ch];
     let b = textureLoad(aux, vec2<i32>(j, row), 0)[ch];
     return a + (b - a) * (p - f32(i));
+}
+
+// Entry `i` of the LUT cube whose entries start at texel `first`.
+fn lut_at(first: i32, i: i32) -> vec3<f32> {
+    let t = first + i;
+    return textureLoad(aux, vec2<i32>(t % LUMETRI_N, t / LUMETRI_N), 0).xyz;
+}
+
+// `Lut3d::apply`: tetrahedral interpolation in an `n`³ cube over the domain `lo`…`hi`.
+fn lut_apply(c: vec3<f32>, n: i32, first: i32, lo: vec3<f32>, hi: vec3<f32>) -> vec3<f32> {
+    let x = clamp((c - lo) / (hi - lo), vec3(0.0), vec3(1.0)) * f32(n - 1);
+    let i0 = min(vec3<i32>(x), vec3<i32>(n - 2));
+    let f = x - vec3<f32>(i0);
+    let fr = f.x;
+    let fg = f.y;
+    let fb = f.z;
+    let base = i0.x + i0.y * n + i0.z * n * n;
+    let dr = 1;
+    let dg = n;
+    let db = n * n;
+    let c000 = lut_at(first, base);
+    let c111 = lut_at(first, base + dr + dg + db);
+    var ca: vec3<f32>;
+    var cb: vec3<f32>;
+    var w: vec4<f32>;
+    if fr > fg {
+        if fg > fb {
+            ca = lut_at(first, base + dr); cb = lut_at(first, base + dr + dg); w = vec4(1.0 - fr, fr - fg, fg - fb, fb);
+        } else if fr > fb {
+            ca = lut_at(first, base + dr); cb = lut_at(first, base + dr + db); w = vec4(1.0 - fr, fr - fb, fb - fg, fg);
+        } else {
+            ca = lut_at(first, base + db); cb = lut_at(first, base + dr + db); w = vec4(1.0 - fb, fb - fr, fr - fg, fg);
+        }
+    } else if fb > fg {
+        ca = lut_at(first, base + db); cb = lut_at(first, base + dg + db); w = vec4(1.0 - fb, fb - fg, fg - fr, fr);
+    } else if fb > fr {
+        ca = lut_at(first, base + dg); cb = lut_at(first, base + dg + db); w = vec4(1.0 - fg, fg - fb, fb - fr, fr);
+    } else {
+        ca = lut_at(first, base + dg); cb = lut_at(first, base + dr + dg); w = vec4(1.0 - fg, fg - fr, fr - fb, fb);
+    }
+    return w.x * c000 + w.y * ca + w.z * cb + w.w * c111;
 }
 
 fn s_curve(v: f32, k: f32) -> f32 {
@@ -440,9 +482,14 @@ fn hsl_key(v: vec3<f32>, hc: f32, hr: f32, smin: f32, lmin: f32, lmax: f32, soft
 fn lumetri(c0: vec3<f32>, p: vec2<i32>) -> vec3<f32> {
     let t0 = lp(0); let t1 = lp(1); let t2 = lp(2); let t3 = lp(3); let t4 = lp(4); let t5 = lp(5); let t6 = lp(6);
     let t7 = lp(7); let t8 = lp(8); let t9 = lp(9); let t10 = lp(10); let t11 = lp(11); let t12 = lp(12);
+    let t13 = lp(13);
 
-    // Basic Correction, Creative, Vignette
-    var v = enc(c0 * t0.xyz * t0.w);
+    // Input LUT, Basic Correction, Creative, Vignette
+    var cin = c0;
+    if t13.x > 0.5 {
+        cin = dec(lut_apply(clamp(enc(c0), vec3(0.0), vec3(1.0)), i32(t13.x), i32(t13.y), lp(14).xyz, lp(15).xyz));
+    }
+    var v = enc(cin * t0.xyz * t0.w);
     let b0 = t1.x; let w0 = t1.y;
     v = (v - b0) / max(w0 - b0, 1e-3);
     let l = luma709(v);
@@ -501,7 +548,10 @@ fn lumetri(c0: vec3<f32>, p: vec2<i32>) -> vec3<f32> {
     if t8.w > 0.5 {
         var a = enc(c);
         let look = u32(t5.w);
-        if look > 0u {
+        if t13.z > 0.5 {
+            let lk = lut_apply(clamp(a, vec3(0.0), vec3(1.0)), i32(t13.z), i32(t13.w), lp(16).xyz, lp(17).xyz);
+            a = a + (lk - a) * t6.x;
+        } else if look > 0u {
             let lk = lumetri_look(look, a);
             a = a + (lk - a) * t6.x;
         }
