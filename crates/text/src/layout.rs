@@ -754,6 +754,12 @@ fn cache() -> &'static Mutex<HashMap<u64, (u64, Arc<Layout>)>> {
     C.get_or_init(Default::default)
 }
 
+/// Forget every cached layout. Layouts are cached by family *name*, so after fonts are added
+/// (a family that was missing, drawn with the fallback) text must be laid out again.
+pub fn clear_cache() {
+    cache().lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
 /// Lay out `text` (cached by text and styles).
 pub fn layout(text: &str, style: &TextStyle, para: &ParagraphStyle) -> Arc<Layout> {
     layout_rich(text, style, &[], para)

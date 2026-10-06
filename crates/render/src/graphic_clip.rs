@@ -339,6 +339,13 @@ fn raster_cache() -> &'static Cache {
     C.get_or_init(Default::default)
 }
 
+/// Forget every cached layer raster. Rasters are cached by their spec, which names fonts by
+/// family, so after fonts are added (a missing family drawn with the fallback) layers must be
+/// rasterised again.
+pub fn clear_raster_cache() {
+    raster_cache().lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
 /// [`raster_layer`] through a small cache (static titles re-composite without re-rasterising).
 pub fn raster_layer_cached(spec: &LayerSpec, m: &Xform, cw: usize, ch: usize) -> Option<Arc<LayerRaster>> {
     let mut hs = std::collections::hash_map::DefaultHasher::new();
