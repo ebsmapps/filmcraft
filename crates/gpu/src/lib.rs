@@ -82,6 +82,9 @@ pub struct GpuCompositor {
     fx: Option<fx::FxStage>,
     /// Total bytes uploaded (stats).
     pub uploaded_bytes: u64,
+    /// Input transforms of log / HDR / wide-gamut layers as table textures, by transform (the
+    /// transforms are shared, so a handful cover a project), with when they were last used.
+    color_tables: HashMap<usize, (Arc<filmcraft_color::InputTransform>, wgpu::TextureView, u64)>,
 }
 
 fn tex_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
@@ -224,6 +227,7 @@ impl GpuCompositor {
                 tex_entry(1),
                 tex_entry(2),
                 tex_entry(3),
+                tex_entry(5),
             ],
         });
         let blend_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -239,6 +243,7 @@ impl GpuCompositor {
                 tex_entry(2),
                 tex_entry(3),
                 tex_entry(4),
+                tex_entry(5),
             ],
         });
         let final_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -335,6 +340,7 @@ impl GpuCompositor {
             dummy,
             fx,
             uploaded_bytes: 0,
+            color_tables: HashMap::new(),
         }
     }
 
@@ -461,7 +467,7 @@ impl GpuCompositor {
     /// The source description of an uploaded frame.
     fn src_info(&self, f: &VideoFrame, key: (usize, u32, u32)) -> Option<SrcInfo> {
         let up = self.uploads.get(&key)?;
-        Some(SrcInfo { kind: up.kind, code_scale: up.code_scale, chroma: up.chroma, size: (f.width, f.height), color: f.color })
+        Some(SrcInfo { kind: up.kind, code_scale: up.code_scale, chroma: up.chroma, size: (f.width, f.height), color: f.color, managed: false })
     }
 
     fn uniforms(src: &SrcInfo, m: &filmcraft_geom::Affine, opacity: f32, blend: Blend, out: (u32, u32)) -> [f32; 28] {
@@ -510,10 +516,51 @@ impl GpuCompositor {
             src.code_scale,
             footprint.max(1.0),
             blend.index() as f32,
-            0.0,
+            if src.managed { 1.0 } else { 0.0 },
             0.0,
             0.0,
         ]
+    }
+
+    /// The table texture of an input transform (made on first use; the eight most recently used
+    /// stay). None when the transform doesn't fit one.
+    fn color_table(&mut self, t: &Arc<filmcraft_color::InputTransform>) -> Option<wgpu::TextureView> {
+        let key = Arc::as_ptr(t) as usize;
+        self.clock += 1;
+        if let Some(entry) = self.color_tables.get_mut(&key) {
+            entry.2 = self.clock;
+            return Some(entry.1.clone());
+        }
+        let data = t.gpu_data()?;
+        let (w, h) = (filmcraft_color::GPU_TABLE_WIDTH as u32, 3u32);
+        if self.device.limits().max_texture_dimension_2d < w {
+            return None;
+        }
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("color-table"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            &bytes,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 16), rows_per_image: Some(h) },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        let view = texture.create_view(&Default::default());
+        if self.color_tables.len() >= 8
+            && let Some(oldest) = self.color_tables.iter().min_by_key(|(_, e)| e.2).map(|(k, _)| *k)
+        {
+            self.color_tables.remove(&oldest);
+        }
+        self.color_tables.insert(key, (t.clone(), view.clone(), self.clock));
+        Some(view)
     }
 
     fn uniform_buffer(&self, u: &[f32; 28]) -> wgpu::Buffer {
@@ -550,7 +597,8 @@ impl GpuCompositor {
                     },
                     None => VideoFrame::rgba_f32(img.w as u32, img.h as u32, img.px.clone()),
                 };
-                owned = [PlanLayer { frame: Arc::new(frame), matrix: filmcraft_geom::Affine::IDENTITY, opacity: 1.0, blend: Blend::Normal, fx: None }];
+                owned =
+                    [PlanLayer { frame: Arc::new(frame), matrix: filmcraft_geom::Affine::IDENTITY, opacity: 1.0, blend: Blend::Normal, fx: None, color: None }];
                 (img.w as u32, img.h as u32, &owned[..])
             }
         };
@@ -598,13 +646,23 @@ impl GpuCompositor {
         }
         for (l, k) in layers.iter().zip(&keys) {
             // (every frame was just uploaded; a missing upload draws transparent texels)
-            let src = self.src_info(&l.frame, *k).unwrap_or(SrcInfo {
+            let mut src = self.src_info(&l.frame, *k).unwrap_or(SrcInfo {
                 kind: 1,
                 code_scale: 1.0,
                 chroma: (1, 1),
                 size: (l.frame.width, l.frame.height),
                 color: l.frame.color,
+                managed: false,
             });
+            // log / HDR media: the input transform's tables (only Y'CbCr frames take them)
+            let color_view = match l.color.as_ref().filter(|_| src.kind == 2) {
+                Some(t) => {
+                    let view = self.color_table(t);
+                    src.managed = view.is_some();
+                    view.unwrap_or_else(|| self.dummy.clone())
+                }
+                None => self.dummy.clone(),
+            };
             let views = self.uploads.get(k).map_or_else(|| [self.dummy.clone(), self.dummy.clone(), self.dummy.clone()], |up| up.views.clone());
             let job = match &l.fx {
                 Some(lfx) => {
@@ -620,6 +678,7 @@ impl GpuCompositor {
                             wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&views[0]) },
                             wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&views[1]) },
                             wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&views[2]) },
+                            wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&color_view) },
                         ],
                     });
                     match self.fx.as_mut() {
@@ -632,7 +691,7 @@ impl GpuCompositor {
             // what the layer draws: the effect result (linear premultiplied RGBA) or the frame
             let (u, tex) = match &job {
                 Some(j) => {
-                    let s = SrcInfo { kind: 1, code_scale: 1.0, chroma: l.size(), size: l.size(), color: l.frame.color };
+                    let s = SrcInfo { kind: 1, code_scale: 1.0, chroma: l.size(), size: l.size(), color: l.frame.color, managed: false };
                     (Self::uniforms(&s, &l.matrix, l.opacity, l.blend, (w, h)), [j.result.clone(), self.dummy.clone(), self.dummy.clone()])
                 }
                 None => {
@@ -649,6 +708,7 @@ impl GpuCompositor {
                     (Self::uniforms(&src, &m, l.opacity, l.blend, (w, h)), views)
                 }
             };
+            let drawn_by_fx = job.is_some();
             jobs.push(job);
             let buf = self.uniform_buffer(&u);
             let mut entries = vec![
@@ -656,6 +716,7 @@ impl GpuCompositor {
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&tex[0]) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&tex[1]) },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&tex[2]) },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(if drawn_by_fx { &self.dummy } else { &color_view }) },
             ];
             let (layout, region) = match (&backdrop_view, l.blend.reads_destination()) {
                 (Some(b), true) => {
@@ -762,6 +823,7 @@ impl GpuCompositor {
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&views[0]) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&views[1]) },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&views[2]) },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&self.dummy) },
             ],
         });
         let stage = self.fx.as_mut()?;
@@ -844,6 +906,8 @@ struct SrcInfo {
     chroma: (u32, u32),
     size: (u32, u32),
     color: filmcraft_color::ColorInfo,
+    /// The frame converts through the layer's input transform (binding 5) instead of its transfer.
+    managed: bool,
 }
 
 /// A render pass drawing into the accumulator.
@@ -885,6 +949,8 @@ fn quad_bounds(l: &PlanLayer, w: u32, h: u32) -> Option<(u32, u32, u32, u32)> {
 
 #[cfg(test)]
 mod blend_tests;
+#[cfg(test)]
+mod color_tests;
 #[cfg(test)]
 mod fx_tests;
 #[cfg(test)]

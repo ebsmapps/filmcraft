@@ -34,6 +34,9 @@ pub struct PlanLayer {
     pub blend: Blend,
     /// Standard effects to run on the frame before it is placed (None: draw the frame directly).
     pub fx: Option<Arc<LayerFx>>,
+    /// Log / HDR / wide-gamut media: the conversion into the working space, done where the
+    /// frame is decoded (None: the frame's own transfer, as for Rec. 709 media).
+    pub color: Option<Arc<filmcraft_color::InputTransform>>,
 }
 
 /// The GPU effect stage of a layer: the frame is decoded into a working image of `size` (the
@@ -49,7 +52,7 @@ pub struct LayerFx {
 impl PlanLayer {
     /// A layer drawing `frame` directly.
     pub fn new(frame: Arc<VideoFrame>, matrix: Affine, opacity: f32, blend: Blend) -> Self {
-        Self { frame, matrix, opacity, blend, fx: None }
+        Self { frame, matrix, opacity, blend, fx: None, color: None }
     }
 
     /// Size of the picture the matrix places: the working image with effects, else the frame.
@@ -235,10 +238,16 @@ fn push_item(
         let want = (lin * opts.scale as f64).clamp(1.0 / 64.0, 1.0) as f32;
         let Ok(frame) = src.video_frame(FrameRequest { time: ft, scale: want }) else { return };
         let cs = crate::colorman::source_space(project, item.item, &frame);
-        // log / HDR / wide-gamut media is converted on the CPU (below), and so are blended
-        // in-between frames (Frame Blending / Optical Flow on speed-changed clips)
-        let plain =
-            !crate::colorman::needs_management(&seq.settings.color, cs, &frame) && crate::interpolation_blend(item, t, src.info().frame_rate()).is_none();
+        // log / HDR / wide-gamut Y'CbCr media converts on the GPU as it is decoded (the input
+        // transform travels with the layer); other managed media converts on the CPU (below),
+        // and so do blended in-between frames (Frame Blending / Optical Flow on speed-changed clips)
+        let color = if crate::colorman::needs_management(&seq.settings.color, cs, &frame) {
+            gpu_input_transform(project, item.item, cs, &frame, &seq.settings.color)
+        } else {
+            None
+        };
+        let plain = (color.is_some() || !crate::colorman::needs_management(&seq.settings.color, cs, &frame))
+            && crate::interpolation_blend(item, t, src.info().frame_rate()).is_none();
         if plain && !chain.is_empty() {
             // GPU effect stage: the working image the CPU would decode (`base_layer`), the
             // effects evaluated for it, placed as `item_layer` places it
@@ -262,7 +271,7 @@ fn push_item(
                     .then_apply(&motion)
                     .then_apply(&Affine::scale(1.0 / px_scale as f64, 1.0 / px_scale as f64));
                 let fx = LayerFx { size: (lw as u32, lh as u32), decimation: n as u32, ops };
-                out.push(PlanLayer { frame, matrix: m, opacity: op * extra_opacity, blend: bl, fx: Some(Arc::new(fx)) });
+                out.push(PlanLayer { frame, matrix: m, opacity: op * extra_opacity, blend: bl, fx: Some(Arc::new(fx)), color });
                 return;
             }
         } else if plain {
@@ -277,7 +286,7 @@ fn push_item(
             };
             let px_scale = frame.width as f64 / size.0.max(1) as f64;
             let m = Affine::scale(opts.scale as f64, opts.scale as f64).then_apply(&motion).then_apply(&Affine::scale(1.0 / px_scale, 1.0 / px_scale));
-            out.push(PlanLayer::new(frame, m, op * extra_opacity, bl));
+            out.push(PlanLayer { color, ..PlanLayer::new(frame, m, op * extra_opacity, bl) });
             return;
         }
     }
@@ -288,6 +297,23 @@ fn push_item(
     }
 }
 
+/// The input transform of a managed frame when the GPU can apply it: planar Y'CbCr without an
+/// alpha plane, in a plain (SDR, BT.709-gamut) working space, with tables that fit a texture row.
+fn gpu_input_transform(
+    project: &Project,
+    item: ItemId,
+    cs: filmcraft_color::ColorSpace,
+    frame: &VideoFrame,
+    pipe: &filmcraft_color::ColorPipeline,
+) -> Option<Arc<filmcraft_color::InputTransform>> {
+    let yuv = matches!(&frame.data, filmcraft_frame::PixelData::Yuv8 { alpha: None, .. } | filmcraft_frame::PixelData::Yuv16 { alpha: None, .. });
+    if !yuv || !pipe.is_plain() {
+        return None;
+    }
+    let t = crate::colorman::input_transform(cs, frame.color.range, pipe, crate::colorman::source_peak_nits(project, item));
+    t.gpu_ready().then_some(t)
+}
+
 fn near_identity(m: &Affine) -> bool {
     (m.a - 1.0).abs() < 1e-9 && (m.d - 1.0).abs() < 1e-9 && m.b.abs() < 1e-9 && m.c.abs() < 1e-9 && m.e.abs() < 1e-6 && m.f.abs() < 1e-6
 }
@@ -295,8 +321,12 @@ fn near_identity(m: &Affine) -> bool {
 /// A layer's working image with its effects applied, on the CPU (the reference for the GPU
 /// effect stage).
 pub fn effect_image(frame: &VideoFrame, fx: &LayerFx) -> crate::Image {
-    let (w, h, px) = frame.to_linear_f32_decimated(fx.decimation.max(1) as usize);
-    let mut img = crate::Image { w, h, px };
+    effect_image_with(frame, fx, None)
+}
+
+/// [`effect_image`] for a frame converted by `color` as it is decoded.
+pub fn effect_image_with(frame: &VideoFrame, fx: &LayerFx, color: Option<&filmcraft_color::InputTransform>) -> crate::Image {
+    let mut img = decode_layer(frame, Some(fx.decimation.max(1) as usize), color);
     for op in &fx.ops {
         op.apply(&mut img);
     }
@@ -311,8 +341,8 @@ pub fn execute_cpu(plan: &FramePlan) -> crate::Image {
             let mut canvas = crate::Image::new(*width, *height);
             for l in layers {
                 let src = match &l.fx {
-                    Some(fx) => effect_image(&l.frame, fx),
-                    None => crate::Image { w: l.frame.width as usize, h: l.frame.height as usize, px: l.frame.to_linear_f32() },
+                    Some(fx) => effect_image_with(&l.frame, fx, l.color.as_deref()),
+                    None => decode_layer(&l.frame, None, l.color.as_deref()),
                 };
                 let placed = if l.matrix == Affine::scale(*width as f64, *height as f64) && src.w == 1 && src.h == 1 {
                     crate::Image::filled(*width, *height, src.get(0, 0))
@@ -324,4 +354,23 @@ pub fn execute_cpu(plan: &FramePlan) -> crate::Image {
             canvas
         }
     }
+}
+
+/// A layer's frame in linear light (box-decimated by `n` for the effect stage), converted by
+/// `color` when it has one (as `colorman::decode` does: the table per channel, the average, then
+/// the pixel stage).
+fn decode_layer(frame: &VideoFrame, n: Option<usize>, color: Option<&filmcraft_color::InputTransform>) -> crate::Image {
+    let Some(t) = color else {
+        let (w, h, px) = match n {
+            Some(n) => frame.to_linear_f32_decimated(n),
+            None => (frame.width as usize, frame.height as usize, frame.to_linear_f32()),
+        };
+        return crate::Image { w, h, px };
+    };
+    let (w, h, px) = frame.to_linear_f32_decimated_with(n.unwrap_or(1), Some(&t.table));
+    let mut img = crate::Image { w, h, px };
+    if t.has_pixel_stage() {
+        img.map_rgb(|c, _, _| t.apply(c));
+    }
+    img
 }

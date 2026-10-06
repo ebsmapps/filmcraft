@@ -259,7 +259,89 @@ impl InputTransform {
     pub fn convert(&self, rgb: [f32; 3]) -> [f32; 3] {
         self.apply(rgb.map(|v| self.table.lookup(v)))
     }
+
+    /// The transform as the GPU compositor reads it: an RGBA32F texture [`GPU_TABLE_WIDTH`]
+    /// wide and 3 rows, flattened. Row 1 holds the decode table and row 2 the tone-mapping table
+    /// (red channel); row 0 the numbers, by texel:
+    ///
+    /// 0: decode entries, decode lo, decode hi, HLG on · 1: HLG luma weights, HLG scale ·
+    /// 2: HLG exponent, matrix is identity, compress, desaturate · 3–5: the matrix rows, each
+    /// followed by tone map on, source peak, target peak · 6: desaturate luma weights, reference
+    /// white · 7: tone entries.
+    ///
+    /// None when a table is longer than a row ([`gpu_ready`](Self::gpu_ready) says ahead).
+    pub fn gpu_data(&self) -> Option<Vec<f32>> {
+        let tone_values = self.tone.as_ref().map(|t| &t.table.values[..]).unwrap_or(&[]);
+        if self.table.values.len() > GPU_TABLE_WIDTH || tone_values.len() > GPU_TABLE_WIDTH || self.table.values.len() < 2 {
+            return None;
+        }
+        let flag = |b: bool| if b { 1.0 } else { 0.0 };
+        let (hl, hk) = self.hlg.unwrap_or(([0.0; 3], 1.0));
+        let (tone_on, src_peak, dst_peak) = match &self.tone {
+            Some(t) => (1.0, t.src_peak_nits as f32, t.dst_peak_nits as f32),
+            None => (0.0, 0.0, 0.0),
+        };
+        let m = self.matrix;
+        let d = self.desaturate.unwrap_or([0.0; 3]);
+        let row0 = [
+            self.table.values.len() as f32,
+            self.table.lo,
+            self.table.hi,
+            flag(self.hlg.is_some()), //
+            hl[0],
+            hl[1],
+            hl[2],
+            hk, //
+            (HLG_GAMMA - 1.0) as f32,
+            flag(self.identity_matrix),
+            flag(self.compress),
+            flag(self.desaturate.is_some()), //
+            m[0][0],
+            m[0][1],
+            m[0][2],
+            tone_on, //
+            m[1][0],
+            m[1][1],
+            m[1][2],
+            src_peak, //
+            m[2][0],
+            m[2][1],
+            m[2][2],
+            dst_peak, //
+            d[0],
+            d[1],
+            d[2],
+            REFERENCE_WHITE_NITS as f32, //
+            tone_values.len() as f32,
+            0.0,
+            0.0,
+            0.0,
+        ];
+        let mut out = vec![0f32; GPU_TABLE_WIDTH * 3 * 4];
+        for (o, v) in out.iter_mut().zip(row0) {
+            *o = v;
+        }
+        for (row, values) in [(1usize, &self.table.values[..]), (2, tone_values)] {
+            for (x, v) in values.iter().enumerate() {
+                if let Some(slot) = out.get_mut((row * GPU_TABLE_WIDTH + x) * 4) {
+                    *slot = *v;
+                }
+            }
+        }
+        Some(out)
+    }
 }
+
+impl InputTransform {
+    /// Whether [`gpu_data`](Self::gpu_data) can describe this transform (its tables fit).
+    pub fn gpu_ready(&self) -> bool {
+        let tone = self.tone.as_ref().map_or(0, |t| t.table.values.len());
+        (2..=GPU_TABLE_WIDTH).contains(&self.table.values.len()) && tone <= GPU_TABLE_WIDTH
+    }
+}
+
+/// Width of [`InputTransform::gpu_data`]'s rows: the longest decode table (log curves).
+pub const GPU_TABLE_WIDTH: usize = 8192;
 
 /// Whether gamut `a` lies inside gamut `b` (so no compression is needed going a → b).
 fn gamut_within(a: Gamut, b: Gamut) -> bool {

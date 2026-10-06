@@ -14,7 +14,7 @@ struct U {
     p0: vec4<f32>,   // opacity, kind (0 rgba8 srgb straight, 1 rgba16f premul linear, 2 yuv), taps, transfer (0 srgb, 1 linear, 2 pq, 3 hlg)
     p1: vec4<f32>,   // y_off y_scale c_off c_scale (code units)
     p2: vec4<f32>,   // kr kb code_scale footprint
-    p3: vec4<f32>,   // blend mode (index into filmcraft_render::Blend::ALL), unused ×3
+    p3: vec4<f32>,   // blend mode (index into filmcraft_render::Blend::ALL), managed colour (1: `color_table`), unused ×2
 };
 
 @group(0) @binding(0) var<uniform> u: U;
@@ -23,6 +23,9 @@ struct U {
 @group(0) @binding(3) var tex2: texture_2d<f32>;
 // The accumulator under the layer (blend modes other than Normal / Dissolve only).
 @group(0) @binding(4) var backdrop: texture_2d<f32>;
+// Log / HDR / wide-gamut media: `filmcraft_color::InputTransform::gpu_data` (row 0 its numbers,
+// row 1 the decode table, row 2 the tone-mapping table).
+@group(0) @binding(5) var color_table: texture_2d<f32>;
 
 struct VOut {
     @builtin(position) pos: vec4<f32>,
@@ -80,6 +83,113 @@ fn to_linear(v: vec3<f32>) -> vec3<f32> {
     return srgb_to_linear(clamp(v, vec3(0.0), vec3(1.0)));
 }
 
+// ---- managed colour (`filmcraft_color::InputTransform`): signal → working linear BT.709
+
+fn ct(i: i32) -> vec4<f32> {
+    return textureLoad(color_table, vec2<i32>(i, 0), 0);
+}
+
+// `DecodeTable::lookup` on a row of `color_table` (n entries over lo..hi).
+fn table_lookup(row: i32, n: i32, lo: f32, hi: f32, v: f32) -> f32 {
+    let last = max(n - 1, 1);
+    let p = clamp((v - lo) / (hi - lo), 0.0, 1.0) * f32(last);
+    let i = min(i32(p), last - 1);
+    let f = p - f32(i);
+    let a = textureLoad(color_table, vec2<i32>(i, row), 0).r;
+    let b = textureLoad(color_table, vec2<i32>(i + 1, row), 0).r;
+    return a + (b - a) * f;
+}
+
+// The decode table per channel (signal → linear).
+fn managed_decode(v: vec3<f32>) -> vec3<f32> {
+    let t0 = ct(0);
+    let n = i32(t0.x);
+    return vec3(table_lookup(1, n, t0.y, t0.z, v.x), table_lookup(1, n, t0.y, t0.z, v.y), table_lookup(1, n, t0.y, t0.z, v.z));
+}
+
+// `pow` for x ≥ 0 that is 0 at x = 0 (WGSL leaves pow(0, y) undefined).
+fn pow0(x: f32, y: f32) -> f32 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    return pow(x, y);
+}
+
+fn pq_inverse_eotf(y: f32) -> f32 {
+    let m1 = 0.15930176; let m2 = 78.84375; let c1 = 0.8359375; let c2 = 18.851563; let c3 = 18.6875;
+    let p = pow0(max(y, 0.0), m1);
+    return pow0((c1 + c2 * p) / (1.0 + c3 * p), m2);
+}
+
+// `transform::gamut_compress`
+fn gamut_compress(c: vec3<f32>) -> vec3<f32> {
+    let th = 0.8; let lim = 1.25; let pw = 1.2;
+    let ach = max(max(c.x, c.y), c.z);
+    if ach <= 1e-9 {
+        return max(c, vec3(0.0));
+    }
+    let s = (lim - th) / pow0(pow0((lim - th) / (1.0 - th), pw) - 1.0, 1.0 / pw);
+    var o = c;
+    for (var k = 0; k < 3; k++) {
+        let v = c[k];
+        let d = (ach - v) / ach;
+        if d >= th {
+            let x = (d - th) / s;
+            let dc = th + s * x / pow0(1.0 + pow0(x, pw), 1.0 / pw);
+            o[k] = ach - dc * ach;
+        }
+    }
+    return o;
+}
+
+// `transform::desaturate_into_gamut`
+fn desaturate(c: vec3<f32>, l: vec3<f32>) -> vec3<f32> {
+    let mn = min(min(c.x, c.y), c.z);
+    if mn >= 0.0 {
+        return c;
+    }
+    let y = dot(l, c);
+    if y <= 0.0 {
+        return vec3(0.0);
+    }
+    let t = y / (y - mn);
+    return max(y + (c - y) * t, vec3(0.0));
+}
+
+// `InputTransform::apply`: HLG system gamma, gamut matrix, tone mapping, gamut compression /
+// desaturation, on the (averaged) decoded colour.
+fn managed_stage(c0: vec3<f32>) -> vec3<f32> {
+    var c = c0;
+    let t0 = ct(0); let t1 = ct(1); let t2 = ct(2); let t3 = ct(3); let t4 = ct(4); let t5 = ct(5); let t6 = ct(6); let t7 = ct(7);
+    if t0.w > 0.5 {
+        let ys = max(dot(t1.xyz, c), 0.0);
+        c = c * (t1.w * pow0(ys, t2.x));
+    }
+    if t2.y < 0.5 {
+        c = vec3(dot(t3.xyz, c), dot(t4.xyz, c), dot(t5.xyz, c));
+    }
+    if t3.w > 0.5 {
+        let m = max(max(c.x, c.y), c.z);
+        if m > 0.0 {
+            let nits = m * t6.w;
+            var k: f32;
+            if nits >= t4.w {
+                k = (t5.w / t6.w) / m;
+            } else {
+                k = table_lookup(2, i32(t7.x), 0.0, 1.0, pq_inverse_eotf(nits / 10000.0));
+            }
+            c = c * k;
+        }
+    }
+    if t2.z > 0.5 {
+        c = gamut_compress(c);
+    }
+    if t2.w > 0.5 {
+        c = desaturate(c, t6.xyz);
+    }
+    return c;
+}
+
 // One linear premultiplied sample at source position p.
 fn sample(p: vec2<f32>) -> vec4<f32> {
     let kind = u32(u.p0.y);
@@ -103,6 +213,10 @@ fn sample(p: vec2<f32>) -> vec4<f32> {
     let R = y + 2.0 * (1.0 - kr) * r;
     let B = y + 2.0 * (1.0 - kb) * b;
     let G = (y - kr * R - kb * B) / kg;
+    if u.p3.y > 0.5 {
+        // the per-pixel stage runs on the average (`layer_color`), as the CPU decodes
+        return vec4(managed_decode(vec3(R, G, B)), 1.0);
+    }
     return vec4(to_linear(vec3(R, G, B)), 1.0);
 }
 
@@ -117,7 +231,11 @@ fn layer_color(sp: vec2<f32>) -> vec4<f32> {
             acc += sample(sp + off * fp);
         }
     }
-    return acc / f32(n * n) * u.p0.x;
+    var c = acc / f32(n * n);
+    if u.p3.y > 0.5 {
+        c = vec4(managed_stage(c.rgb), c.a);
+    }
+    return c * u.p0.x;
 }
 
 // ---- Dissolve: the CPU's 64-bit pixel hash (`blend::hash2`), on 32-bit halves (lo, hi).
